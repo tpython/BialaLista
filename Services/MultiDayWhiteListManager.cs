@@ -151,6 +151,20 @@ public sealed class MultiDayWhiteListManager : IDisposable
             using var response = await client.GetAsync(url, ct);
             string content = await response.Content.ReadAsStringAsync(ct);
 
+            string trimmedContent = content.TrimStart();
+            bool isJson = (response.Content.Headers.ContentType?.MediaType?.Contains("json", StringComparison.OrdinalIgnoreCase) == true)
+                || (trimmedContent.StartsWith('{') || trimmedContent.StartsWith('['));
+
+            if (!isJson)
+            {
+                _logger.LogWarning("Oficjalne API MF zwróciło odpowiedź niebędącą JSON ({StatusCode}): {Url}", response.StatusCode, url);
+                return Results.Json(new
+                {
+                    code = "WL-500",
+                    message = "Błąd komunikacji z bramką Ministerstwa Finansów (bramka MF zwróciła stronę HTML lub błąd WAF zamiast formatu JSON)."
+                }, statusCode: StatusCodes.Status502BadGateway);
+            }
+
             if (response.IsSuccessStatusCode)
             {
                 var (mfReqId, mfAssigned, _) = ParseMfResponse(content);

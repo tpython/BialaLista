@@ -33,7 +33,7 @@ builder.Services.AddMemoryCache(options =>
 });
 
 // 4. HttpClient do Fallbacku na oficjalne API MF
-string mfApiUrl = builder.Configuration["MF_API_BASE_URL"] ?? "https://wykazpodatnikowvat.mf.gov.pl/";
+string mfApiUrl = builder.Configuration["MF_API_BASE_URL"] ?? "https://wl-api.mf.gov.pl/";
 builder.Services.AddHttpClient("MfApi", client =>
 {
     client.BaseAddress = new Uri(mfApiUrl);
