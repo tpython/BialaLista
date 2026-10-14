@@ -130,7 +130,8 @@ public sealed class WhiteListSyncBackgroundService : BackgroundService
             ParsedFlatFileMetadata newMeta;
             using (var archive = ArchiveFactory.OpenArchive(temp7z))
             {
-                var entry = archive.Entries.First(e => !e.IsDirectory);
+                var entry = archive.Entries.FirstOrDefault(e => !e.IsDirectory && (e.Key?.EndsWith(".json", StringComparison.OrdinalIgnoreCase) ?? false))
+                    ?? throw new InvalidOperationException($"Nie odnaleziono pliku JSON w archiwum {temp7z}.");
                 await using var stream = entry.OpenEntryStream();
                 newMeta = await FlatFileStreamParser.ParseAndConvertAsync(stream, tempBin, ct);
             }

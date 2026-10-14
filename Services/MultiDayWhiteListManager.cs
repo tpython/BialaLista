@@ -96,7 +96,9 @@ public sealed class MultiDayWhiteListManager : IDisposable
     public async Task<IResult> CheckAccountAsync(string identifier, string bankAccount, string dateIso, string idType, CancellationToken ct)
     {
         string rawDate = dateIso.Replace("-", "");
-        if (_snapshots.TryGetValue(rawDate, out DaySnapshot? snapshot))
+        // Plik płaski MF zawiera wyłącznie skróty generowane dla numerów NIP (Data + NIP + NRB).
+        // Zapytania dla numeru REGON nie mogą być sprawdzane w pliku płaskim i trafiają bezpośrednio do Fallbacku MF API.
+        if (idType.Equals("nip", StringComparison.OrdinalIgnoreCase) && _snapshots.TryGetValue(rawDate, out DaySnapshot? snapshot))
         {
             try
             {

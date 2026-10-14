@@ -37,7 +37,7 @@ string mfApiUrl = builder.Configuration["MF_API_BASE_URL"] ?? "https://wl-api.mf
 builder.Services.AddHttpClient("MfApi", client =>
 {
     client.BaseAddress = new Uri(mfApiUrl);
-    client.Timeout = TimeSpan.FromSeconds(5);
+    client.Timeout = TimeSpan.FromSeconds(15);
     client.DefaultRequestHeaders.UserAgent.ParseAdd("WhiteListProxy/1.0");
 });
 
@@ -84,15 +84,25 @@ builder.Services.AddRateLimiter(options =>
     };
 
     options.GlobalLimiter = PartitionedRateLimiter.CreateChained(
-        PartitionedRateLimiter.Create<HttpContext, string>(_ =>
-            RateLimitPartition.GetConcurrencyLimiter("CpuRamGuard", _ => new ConcurrencyLimiterOptions
+        PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
+        {
+            // Sonda /healthz dla Azure Container Apps nigdy nie może być ograniczana ConcurrencyLimiterem
+            if (httpContext.Request.Path.StartsWithSegments("/healthz"))
+                return RateLimitPartition.GetNoLimiter("healthz");
+
+            return RateLimitPartition.GetConcurrencyLimiter("CpuRamGuard", _ => new ConcurrencyLimiterOptions
             {
                 PermitLimit = 16,
                 QueueLimit = 0
-            })),
+            });
+        }),
 
         PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
         {
+            // Sonda /healthz nie zużywa dziennego limitu zapytań
+            if (httpContext.Request.Path.StartsWithSegments("/healthz"))
+                return RateLimitPartition.GetNoLimiter("healthz");
+
             string clientKey = ResolveClientKey(httpContext);
             string rawKeyPart = clientKey.StartsWith("key:") ? clientKey[4..] : string.Empty;
 
@@ -121,6 +131,7 @@ builder.Services.AddRateLimiter(options =>
 var app = builder.Build();
 
 app.UseForwardedHeaders();
+app.UseRouting();
 app.UseRateLimiter();
 
 // Strefa czasowa dla Polski
@@ -140,7 +151,7 @@ app.MapGet("/healthz", (MultiDayWhiteListManager manager) =>
     };
 
     return isReady ? Results.Ok(payload) : Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
-});
+}).DisableRateLimiting();
 
 // Wspólny handler dla NIP i REGON zgodny z kodami błędów Ministerstwa Finansów
 Func<string, string, string?, string, MultiDayWhiteListManager, CancellationToken, Task<IResult>> checkHandler =
@@ -187,6 +198,13 @@ app.Run();
 
 static string ResolveClientKey(HttpContext ctx)
 {
+    var path = ctx.Request.Path;
+    if (path.StartsWithSegments("/k", out var remaining))
+    {
+        var segments = remaining.Value?.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        if (segments is { Length: > 0 } && !string.IsNullOrEmpty(segments[0]))
+            return $"key:{segments[0]}";
+    }
     if (ctx.Request.RouteValues.TryGetValue("apiKey", out var rk) && rk is string s && !string.IsNullOrEmpty(s))
         return $"key:{s}";
     if (ctx.Request.Query.TryGetValue("apiKey", out var qk) && !string.IsNullOrEmpty(qk))

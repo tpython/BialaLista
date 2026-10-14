@@ -193,6 +193,48 @@ public class MultiDayWhiteListManagerTests
         Assert.Equal(1, fakeHandler.CallCount);
     }
 
+    [Fact]
+    public async Task CheckAccountAsync_DirectlyFallsBackToMfApi_ForRegon_EvenWhenLocalDayIsLoaded()
+    {
+        string mfJson = """
+        {
+            "result": {
+                "requestId": "20261014-mf-regon-test",
+                "accountAssigned": "TAK",
+                "requestDateTime": "14-10-2026 19:00:00"
+            }
+        }
+        """;
+
+        var fakeHandler = new FakeHttpMessageHandler(mfJson, System.Net.HttpStatusCode.OK);
+        var clientFactory = new MockHttpClientFactory(new HttpClient(fakeHandler) { BaseAddress = new Uri("https://mock.mf.gov.pl/") });
+        var cache = new MemoryCache(new MemoryCacheOptions());
+        var auditService = new AuditLogChannelService(new EmptyServiceProvider(), NullLogger<AuditLogChannelService>.Instance);
+        using var manager = new MultiDayWhiteListManager(
+            clientFactory,
+            cache,
+            auditService,
+            NullLogger<MultiDayWhiteListManager>.Instance);
+
+        string dummyBin = CreateDummyBin();
+        try
+        {
+            // Rejestrujemy dzień lokalny (który zawiera wyłącznie NIP-y)
+            manager.RegisterOrUpdateDay("2026-10-14", dummyBin, 5000, []);
+            Assert.True(manager.HasDayLoaded("20261014"));
+
+            // Sprawdzamy REGON - nie powinien szukać w pliku płaskim NIP-ów, lecz uderzyć prosto do MF API
+            var result = await manager.CheckAccountAsync("012584144", "94102010260000140201648043", "2026-10-14", "regon", CancellationToken.None);
+
+            Assert.Equal(200, (result as IStatusCodeHttpResult)?.StatusCode);
+            Assert.Equal(1, fakeHandler.CallCount);
+        }
+        finally
+        {
+            if (File.Exists(dummyBin)) File.Delete(dummyBin);
+        }
+    }
+
     private static string CreateDummyBin()
     {
         string p = Path.GetTempFileName();

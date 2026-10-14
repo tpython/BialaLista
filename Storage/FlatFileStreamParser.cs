@@ -18,7 +18,7 @@ public static class FlatFileStreamParser
     public static async Task<ParsedFlatFileMetadata> ParseAndConvertAsync(Stream jsonStream, string outputBinaryPath, CancellationToken ct)
     {
         var metadata = new ParsedFlatFileMetadata();
-        var hashes = new List<UInt128>(capacity: 5_500_000);
+        var hashes = new List<UInt128>(capacity: 6_500_000);
         byte[] buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
         int bytesInBuffer = 0;
         var state = new JsonReaderState(new JsonReaderOptions { AllowTrailingCommas = true });
@@ -56,6 +56,10 @@ public static class FlatFileStreamParser
                             break;
                         case JsonTokenType.Number when section == 1 && currentProperty == "liczbaTransformacji":
                             metadata.Iterations = reader.GetInt32();
+                            break;
+                        case JsonTokenType.EndObject when section == 1:
+                            section = 0;
+                            currentProperty = null;
                             break;
                         case JsonTokenType.EndArray when section is 2 or 3:
                             section = 0;

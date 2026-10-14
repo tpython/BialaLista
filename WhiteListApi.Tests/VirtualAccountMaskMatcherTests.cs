@@ -30,6 +30,22 @@ public class VirtualAccountMaskMatcherTests
     }
 
     [Fact]
+    public void TryApplyMask_AppliesLowercaseXAndYCorrectly()
+    {
+        string account = "94102010260000140201648043";
+        string mask = "941020yyyyyyyyyyxxxxxxxxxx"; // małe litery y i x
+
+        Span<char> output = stackalloc char[26];
+        bool success = VirtualAccountMaskMatcher.TryApplyMask(account.AsSpan(), mask.AsSpan(), output);
+
+        Assert.True(success);
+        string result = new string(output);
+        Assert.Equal("941020", result[..6]);
+        Assert.Equal("1026000014", result.Substring(6, 10));
+        Assert.Equal("XXXXXXXXXX", result.Substring(16, 10));
+    }
+
+    [Fact]
     public void TryApplyMask_ReturnsFalse_WhenFixedDigitsDoNotMatch()
     {
         string account = "94102010260000140201648043";

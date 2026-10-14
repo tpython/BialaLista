@@ -58,8 +58,8 @@ public sealed class VirtualAccountMaskMatcher
         for (int i = 0; i < 26; i++)
         {
             char m = mask[i], a = account[i];
-            if (m == 'X') outputMaskedAccount[i] = 'X';
-            else if (m == 'Y') outputMaskedAccount[i] = a;
+            if (m is 'X' or 'x') outputMaskedAccount[i] = 'X';
+            else if (m is 'Y' or 'y') outputMaskedAccount[i] = a;
             else
             {
                 if (m != a) return false;
@@ -70,6 +70,9 @@ public sealed class VirtualAccountMaskMatcher
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public static uint GetBankPrefixKey(ReadOnlySpan<char> accountOrMask) =>
-        ((uint)accountOrMask[2] << 24) | ((uint)accountOrMask[3] << 16) | ((uint)accountOrMask[4] << 8) | (uint)accountOrMask[5];
+    public static uint GetBankPrefixKey(ReadOnlySpan<char> accountOrMask)
+    {
+        if (accountOrMask.Length < 6) return 0;
+        return ((uint)accountOrMask[2] << 24) | ((uint)accountOrMask[3] << 16) | ((uint)accountOrMask[4] << 8) | (uint)accountOrMask[5];
+    }
 }

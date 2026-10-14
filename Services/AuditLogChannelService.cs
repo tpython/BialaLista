@@ -120,56 +120,70 @@ public sealed class AuditLogChannelService : BackgroundService
         // 1. Zapis paczki do Azure Blob Storage (.jsonl)
         if (_blobContainer is not null)
         {
-            string day = DateTime.UtcNow.ToString("yyyyMMdd");
-            var blob = _blobContainer.GetBlobClient($"audit/{day}/{Guid.NewGuid():N}.jsonl");
-            var sb = new StringBuilder(batch.Count * 128);
-            foreach (var item in batch)
-                sb.AppendLine(JsonSerializer.Serialize(item));
+            try
+            {
+                string day = DateTime.UtcNow.ToString("yyyyMMdd");
+                var blob = _blobContainer.GetBlobClient($"audit/{day}/{Guid.NewGuid():N}.jsonl");
+                var sb = new StringBuilder(batch.Count * 128);
+                foreach (var item in batch)
+                    sb.AppendLine(JsonSerializer.Serialize(item));
 
-            await blob.UploadAsync(BinaryData.FromString(sb.ToString()), overwrite: true, ct);
+                await blob.UploadAsync(BinaryData.FromString(sb.ToString()), overwrite: true, ct);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Błąd podczas zapisu paczki logów audytowych do Azure Blob Storage.");
+            }
         }
 
         // 2. Zapis transakcyjny do Azure Table Storage (paczki do 100 elementów per PartitionKey)
         if (_tableClient is not null)
         {
-            var byPartition = batch.GroupBy(b => b.QueryDate);
-            foreach (var partitionGroup in byPartition)
+            try
             {
-                var transactions = new List<TableTransactionAction>(100);
-                var seenRowKeys = new HashSet<string>(StringComparer.Ordinal);
-
-                foreach (var item in partitionGroup)
+                var byPartition = batch.GroupBy(b => b.QueryDate);
+                foreach (var partitionGroup in byPartition)
                 {
-                    string rowKey = item.RequestId;
-                    if (!seenRowKeys.Add(rowKey))
+                    var transactions = new List<TableTransactionAction>(100);
+                    var seenRowKeys = new HashSet<string>(StringComparer.Ordinal);
+
+                    foreach (var item in partitionGroup)
                     {
-                        rowKey = $"{item.RequestId}_{Guid.NewGuid():N}";
+                        string rowKey = item.RequestId;
+                        if (!seenRowKeys.Add(rowKey))
+                        {
+                            rowKey = $"{item.RequestId}_{Guid.NewGuid():N}";
+                        }
+
+                        var entity = new TableEntity(item.QueryDate, rowKey)
+                        {
+                            { "TimestampUtc", item.TimestampUtc },
+                            { "Identifier", item.Identifier },
+                            { "BankAccount", item.BankAccount },
+                            { "AccountAssigned", item.AccountAssigned },
+                            { "Source", item.Source }
+                        };
+
+                        transactions.Add(new TableTransactionAction(TableTransactionActionType.UpsertReplace, entity));
+
+                        if (transactions.Count == 100)
+                        {
+                            await _tableClient.SubmitTransactionAsync(transactions, ct);
+                            transactions.Clear();
+                            seenRowKeys.Clear();
+                        }
                     }
 
-                    var entity = new TableEntity(item.QueryDate, rowKey)
-                    {
-                        { "TimestampUtc", item.TimestampUtc },
-                        { "Identifier", item.Identifier },
-                        { "BankAccount", item.BankAccount },
-                        { "AccountAssigned", item.AccountAssigned },
-                        { "Source", item.Source }
-                    };
-
-                    transactions.Add(new TableTransactionAction(TableTransactionActionType.UpsertReplace, entity));
-
-                    if (transactions.Count == 100)
+                    if (transactions.Count > 0)
                     {
                         await _tableClient.SubmitTransactionAsync(transactions, ct);
                         transactions.Clear();
-                        seenRowKeys.Clear();
                     }
                 }
-
-                if (transactions.Count > 0)
-                {
-                    await _tableClient.SubmitTransactionAsync(transactions, ct);
-                    transactions.Clear();
-                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogError(ex, "Błąd podczas zapisu paczki logów audytowych do Azure Table Storage.");
             }
         }
     }
