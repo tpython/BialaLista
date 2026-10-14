@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="WhiteListApi.csproj" />
+  <Project Path="WhiteListApi.Tests/WhiteListApi.Tests.csproj" />
+</Solution>
