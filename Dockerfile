@@ -9,7 +9,12 @@ FROM mcr.microsoft.com/dotnet/aspnet:10.0 AS final
 WORKDIR /app
 EXPOSE 8080
 ENV ASPNETCORE_URLS=http://+:8080
-ENV DOTNET_GCHeapHardLimit=0x18000000
-ENV DOTNET_GCConserveMemory=9
+ENV TZ=Europe/Warsaw
+ENV DOTNET_GCHeapHardLimit=0x30000000
+
+# Instalacja tzdata dla strefy Europe/Warsaw
+RUN apt-get update && apt-get install -y --no-install-recommends tzdata && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build /app/publish .
+USER $APP_UID
 ENTRYPOINT ["dotnet", "WhiteListApi.dll"]

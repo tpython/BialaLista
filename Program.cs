@@ -2,6 +2,7 @@ using System.Threading.RateLimiting;
 using Azure.Data.Tables;
 using Azure.Identity;
 using Azure.Storage.Blobs;
+using Microsoft.AspNetCore.HttpOverrides;
 using Microsoft.AspNetCore.Mvc;
 using WhiteListApi.Configuration;
 using WhiteListApi.Core;
@@ -17,13 +18,21 @@ builder.WebHost.ConfigureKestrel(options =>
     options.Limits.MaxConcurrentConnections = 200;
 });
 
-// 2. Cache dla zapytań Fallback MF (limit 10 000 wpisów, ochrona RAM i limitu 5000 zapytań MF)
+// 2. Obsługa nagłówków Reverse Proxy (Azure Container Apps Ingress / Envoy)
+builder.Services.Configure<ForwardedHeadersOptions>(options =>
+{
+    options.ForwardedHeaders = ForwardedHeaders.XForwardedFor | ForwardedHeaders.XForwardedProto;
+    options.KnownIPNetworks.Clear();
+    options.KnownProxies.Clear();
+});
+
+// 3. Cache dla zapytań Fallback MF (limit 10 000 wpisów, ochrona RAM i limitu 5000 zapytań MF)
 builder.Services.AddMemoryCache(options =>
 {
     options.SizeLimit = 10_000;
 });
 
-// 3. HttpClient do Fallbacku na oficjalne API MF
+// 4. HttpClient do Fallbacku na oficjalne API MF
 string mfApiUrl = builder.Configuration["MF_API_BASE_URL"] ?? "https://wykazpodatnikowvat.mf.gov.pl/";
 builder.Services.AddHttpClient("MfApi", client =>
 {
@@ -32,13 +41,13 @@ builder.Services.AddHttpClient("MfApi", client =>
     client.DefaultRequestHeaders.UserAgent.ParseAdd("WhiteListProxy/1.0");
 });
 
-// 4. HttpClient do pobierania plików .7z z MF
+// 5. HttpClient do pobierania plików .7z z MF
 builder.Services.AddHttpClient("MfFlatFile", client =>
 {
     client.Timeout = TimeSpan.FromMinutes(10);
 });
 
-// 5. Azure Blob & Table Storage Client (Managed Identity)
+// 6. Azure Blob & Table Storage Client (Managed Identity)
 string? blobServiceUri = builder.Configuration["BLOB_STORAGE_URI"] ?? Environment.GetEnvironmentVariable("BLOB_STORAGE_URI");
 if (!string.IsNullOrEmpty(blobServiceUri))
 {
@@ -52,13 +61,13 @@ if (!string.IsNullOrEmpty(tableServiceUri))
     builder.Services.AddSingleton(_ => new TableClient(new Uri(tableServiceUri), tableName, new DefaultAzureCredential()));
 }
 
-// 6. Usługi w tle i menedżer danych
+// 7. Usługi w tle i menedżer danych
 builder.Services.AddSingleton<AuditLogChannelService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<AuditLogChannelService>());
 builder.Services.AddSingleton<MultiDayWhiteListManager>();
 builder.Services.AddHostedService<WhiteListSyncBackgroundService>();
 
-// 7. Rate Limiter (Ochrona CPU/RAM + dzienne limity per klucz ładowane z konfiguracji / env vars)
+// 8. Rate Limiter (Ochrona CPU/RAM + dzienne limity per klucz ładowane z konfiguracji / env vars)
 var clientQuotas = ClientQuotasConfig.LoadClientQuotas(builder.Configuration);
 
 builder.Services.AddRateLimiter(options =>
@@ -93,7 +102,8 @@ builder.Services.AddRateLimiter(options =>
                 {
                     PermitLimit = 20,
                     Window = TimeSpan.FromDays(1),
-                    QueueLimit = 0
+                    QueueLimit = 0,
+                    AutoReplenishment = true
                 });
             }
 
@@ -110,36 +120,47 @@ builder.Services.AddRateLimiter(options =>
 
 var app = builder.Build();
 
+app.UseForwardedHeaders();
 app.UseRateLimiter();
 
-// Endpoint diagnostyczny /healthz
-app.MapGet("/healthz", (MultiDayWhiteListManager manager) => Results.Ok(new
-{
-    status = "Healthy",
-    loadedDates = manager.GetLoadedDates(),
-    memoryAllocatedMb = Math.Round(GC.GetTotalMemory(false) / (1024.0 * 1024.0), 2),
-    machineTime = DateTime.UtcNow.ToString("o")
-}));
+// Strefa czasowa dla Polski
+TimeZoneInfo polandTz = TimeZoneInfo.TryFindSystemTimeZoneById("Europe/Warsaw", out var tz) ? tz : TimeZoneInfo.Local;
 
-// Wspólny handler dla NIP i REGON
+// Endpoint diagnostyczny /healthz (Readiness & Liveness probe dla Azure Container Apps)
+app.MapGet("/healthz", (MultiDayWhiteListManager manager) =>
+{
+    string[] loadedDates = manager.GetLoadedDates();
+    bool isReady = loadedDates.Length > 0;
+    var payload = new
+    {
+        status = isReady ? "Healthy" : "Starting",
+        loadedDates,
+        memoryAllocatedMb = Math.Round(GC.GetTotalMemory(false) / (1024.0 * 1024.0), 2),
+        machineTime = DateTime.UtcNow.ToString("o")
+    };
+
+    return isReady ? Results.Ok(payload) : Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
+});
+
+// Wspólny handler dla NIP i REGON zgodny z kodami błędów Ministerstwa Finansów
 Func<string, string, string?, string, MultiDayWhiteListManager, CancellationToken, Task<IResult>> checkHandler =
     async (identifier, bankAccount, date, idType, manager, ct) =>
     {
         if (idType == "nip" && !PolishIdentifiersValidator.IsValidNip(identifier))
-            return Results.BadRequest(new { code = "WL-115", message = "Niepoprawny numer NIP (błędna suma kontrolna)." });
+            return Results.BadRequest(new { code = "WL-113", message = "Niepoprawny numer NIP (błędna suma kontrolna lub format)." });
 
         if (idType == "regon" && !PolishIdentifiersValidator.IsValidRegon(identifier))
-            return Results.BadRequest(new { code = "WL-115", message = "Niepoprawny numer REGON (błędna suma kontrolna)." });
+            return Results.BadRequest(new { code = "WL-114", message = "Niepoprawny numer REGON (błędna suma kontrolna lub format)." });
 
         if (!PolishIdentifiersValidator.IsValidNrb(bankAccount))
-            return Results.BadRequest(new { code = "WL-116", message = "Niepoprawny numer rachunku bankowego NRB (błędna suma kontrolna)." });
+            return Results.BadRequest(new { code = "WL-115", message = "Niepoprawny numer rachunku bankowego NRB (błędna suma kontrolna lub format)." });
 
         string targetDateIso = string.IsNullOrEmpty(date)
-            ? TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, TimeZoneInfo.Local).ToString("yyyy-MM-dd")
+            ? TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, polandTz).ToString("yyyy-MM-dd")
             : date;
 
         if (!DateOnly.TryParseExact(targetDateIso, "yyyy-MM-dd", out _))
-            return Results.BadRequest(new { code = "WL-117", message = "Data musi być w formacie YYYY-MM-DD." });
+            return Results.BadRequest(new { code = "WL-111", message = "Niepoprawny format daty (wymagany format YYYY-MM-DD)." });
 
         return await manager.CheckAccountAsync(identifier, bankAccount, targetDateIso, idType, ct);
     };

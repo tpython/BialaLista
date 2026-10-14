@@ -107,6 +107,92 @@ public class MultiDayWhiteListManagerTests
         }
     }
 
+    [Fact]
+    public void DaySnapshot_Dispose_DoesNotDeleteBinaryFile()
+    {
+        string dummyBin = CreateDummyBin();
+        try
+        {
+            var store = new WhiteListBinaryStore(dummyBin, 10);
+            var matcher = new VirtualAccountMaskMatcher([]);
+            var snapshot = new DaySnapshot("20261014", store, matcher, dummyBin);
+
+            snapshot.Dispose();
+
+            // Plik musi nadal istnieć na dysku po Dispose()
+            Assert.True(File.Exists(dummyBin));
+        }
+        finally
+        {
+            if (File.Exists(dummyBin)) File.Delete(dummyBin);
+        }
+    }
+
+    [Fact]
+    public void EnforceRetentionPolicy_DeletesExpiredBinaryFileFromDisk()
+    {
+        var cache = new MemoryCache(new MemoryCacheOptions());
+        var auditService = new AuditLogChannelService(new EmptyServiceProvider(), NullLogger<AuditLogChannelService>.Instance);
+        using var manager = new MultiDayWhiteListManager(
+            new DummyHttpClientFactory(),
+            cache,
+            auditService,
+            NullLogger<MultiDayWhiteListManager>.Instance);
+
+        DateTime today = new DateTime(2026, 10, 14);
+        string tempBinFourDaysAgo = CreateDummyBin();
+
+        try
+        {
+            manager.RegisterOrUpdateDay("2026-10-10", tempBinFourDaysAgo, 5000, []);
+            Assert.True(File.Exists(tempBinFourDaysAgo));
+
+            manager.EnforceRetentionPolicy(today);
+
+            // Po EnforceRetentionPolicy plik przeterminowany powinien zostać skasowany z dysku
+            Assert.False(File.Exists(tempBinFourDaysAgo));
+        }
+        finally
+        {
+            if (File.Exists(tempBinFourDaysAgo)) File.Delete(tempBinFourDaysAgo);
+        }
+    }
+
+    [Fact]
+    public async Task CheckAccountAsync_FallsBackToMfApi_WhenNotLoaded_AndLogsAudit()
+    {
+        string mfJson = """
+        {
+            "result": {
+                "requestId": "20261014-mf-test-123",
+                "accountAssigned": "TAK",
+                "requestDateTime": "14-10-2026 18:00:00"
+            }
+        }
+        """;
+
+        var fakeHandler = new FakeHttpMessageHandler(mfJson, System.Net.HttpStatusCode.OK);
+        var clientFactory = new MockHttpClientFactory(new HttpClient(fakeHandler) { BaseAddress = new Uri("https://mock.mf.gov.pl/") });
+        var cache = new MemoryCache(new MemoryCacheOptions());
+        var auditService = new AuditLogChannelService(new EmptyServiceProvider(), NullLogger<AuditLogChannelService>.Instance);
+        using var manager = new MultiDayWhiteListManager(
+            clientFactory,
+            cache,
+            auditService,
+            NullLogger<MultiDayWhiteListManager>.Instance);
+
+        // 1. Pierwsze zapytanie - wywołanie MF i zapis do cache
+        var result1 = await manager.CheckAccountAsync("5260250995", "94102010260000140201648043", "2026-10-14", "nip", CancellationToken.None);
+        var contentResult1 = Assert.IsAssignableFrom<IContentTypeHttpResult>(result1);
+        Assert.Equal(200, (result1 as IStatusCodeHttpResult)?.StatusCode);
+        Assert.Equal(1, fakeHandler.CallCount);
+
+        // 2. Drugie zapytanie - powinno trafić w cache (CallCount nadal 1), ale również przejść poprawnie
+        var result2 = await manager.CheckAccountAsync("5260250995", "94102010260000140201648043", "2026-10-14", "nip", CancellationToken.None);
+        Assert.Equal(200, (result2 as IStatusCodeHttpResult)?.StatusCode);
+        Assert.Equal(1, fakeHandler.CallCount);
+    }
+
     private static string CreateDummyBin()
     {
         string p = Path.GetTempFileName();
@@ -118,5 +204,25 @@ public class MultiDayWhiteListManagerTests
     private class EmptyServiceProvider : IServiceProvider
     {
         public object? GetService(Type serviceType) => null;
+    }
+
+    private class MockHttpClientFactory(HttpClient client) : IHttpClientFactory
+    {
+        public HttpClient CreateClient(string name) => client;
+    }
+
+    private class FakeHttpMessageHandler(string responseBody, System.Net.HttpStatusCode statusCode) : HttpMessageHandler
+    {
+        public int CallCount { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            CallCount++;
+            var response = new HttpResponseMessage(statusCode)
+            {
+                Content = new StringContent(responseBody, System.Text.Encoding.UTF8, "application/json")
+            };
+            return Task.FromResult(response);
+        }
     }
 }

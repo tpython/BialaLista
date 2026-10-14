@@ -15,11 +15,22 @@ env:
   LOCATION: polandcentral
 
 jobs:
-  build-and-deploy:
+  test-and-deploy:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore WhiteListApi.slnx
+
+      - name: Run unit tests
+        run: dotnet test WhiteListApi.slnx -c Release --no-restore --verbosity normal
 
       - name: Azure Login (OIDC)
         uses: azure/login@v2

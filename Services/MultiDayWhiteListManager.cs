@@ -1,6 +1,7 @@
 namespace WhiteListApi.Services;
 
 using System.Collections.Concurrent;
+using System.Text.Json;
 using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Caching.Memory;
 using Microsoft.Extensions.Logging;
@@ -16,7 +17,8 @@ public sealed record DaySnapshot(
     public void Dispose()
     {
         BinaryStore.Dispose();
-        try { if (File.Exists(BinaryFilePath)) File.Delete(BinaryFilePath); } catch { }
+        // Plik binarny nie jest usuwany w Dispose!
+        // Retencją i usuwaniem przeterminowanych plików zarządza wyłącznie EnforceRetentionPolicy.
     }
 }
 
@@ -27,6 +29,7 @@ public sealed class MultiDayWhiteListManager : IDisposable
     private readonly IMemoryCache _fallbackCache;
     private readonly AuditLogChannelService _auditChannel;
     private readonly ILogger<MultiDayWhiteListManager> _logger;
+    private readonly TimeZoneInfo _polandTz;
 
     public MultiDayWhiteListManager(
         IHttpClientFactory httpClientFactory,
@@ -38,6 +41,7 @@ public sealed class MultiDayWhiteListManager : IDisposable
         _fallbackCache = fallbackCache;
         _auditChannel = auditChannel;
         _logger = logger;
+        _polandTz = TimeZoneInfo.TryFindSystemTimeZoneById("Europe/Warsaw", out var tz) ? tz : TimeZoneInfo.Local;
     }
 
     public string[] GetLoadedDates() => [.. _snapshots.Keys];
@@ -75,6 +79,16 @@ public sealed class MultiDayWhiteListManager : IDisposable
             if (!allowedDates.Contains(key) && _snapshots.TryRemove(key, out var oldSnapshot))
             {
                 oldSnapshot.Dispose();
+                try
+                {
+                    if (File.Exists(oldSnapshot.BinaryFilePath))
+                        File.Delete(oldSnapshot.BinaryFilePath);
+
+                    string metaPath = Path.ChangeExtension(oldSnapshot.BinaryFilePath, ".meta.json");
+                    if (File.Exists(metaPath))
+                        File.Delete(metaPath);
+                }
+                catch { }
             }
         }
     }
@@ -93,6 +107,9 @@ public sealed class MultiDayWhiteListManager : IDisposable
                 string assignedStr = isAssigned ? "TAK" : "NIE";
                 string reqId = Guid.NewGuid().ToString("N")[..18];
 
+                DateTime nowInPoland = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, _polandTz);
+                string reqDateFormatted = nowInPoland.ToString("dd-MM-yyyy HH:mm:ss");
+
                 _auditChannel.Enqueue(new AuditLogEntry(
                     reqId, DateTime.UtcNow.ToString("o"), dateIso, identifier, bankAccount, assignedStr, "LOCAL_BIN"));
 
@@ -101,7 +118,7 @@ public sealed class MultiDayWhiteListManager : IDisposable
                     result = new
                     {
                         accountAssigned = assignedStr,
-                        requestDateTime = DateTime.Now.ToString("dd-MM-yyyy HH:mm:ss"),
+                        requestDateTime = reqDateFormatted,
                         requestId = reqId
                     }
                 });
@@ -116,27 +133,68 @@ public sealed class MultiDayWhiteListManager : IDisposable
         string cacheKey = $"fb:{idType}:{identifier}:{bankAccount}:{rawDate}";
         if (_fallbackCache.TryGetValue(cacheKey, out string? cachedJson) && cachedJson is not null)
         {
+            var (cachedReqId, cachedAssigned, _) = ParseMfResponse(cachedJson);
+            string auditReqId = !string.IsNullOrEmpty(cachedReqId) ? cachedReqId : Guid.NewGuid().ToString("N")[..18];
+            string assignedStr = !string.IsNullOrEmpty(cachedAssigned) ? cachedAssigned : "NIE";
+
+            // Każde sprawdzenie - nawet z cache - musi trafić do audytu z oznaczeniem fallbacku
+            _auditChannel.Enqueue(new AuditLogEntry(
+                auditReqId, DateTime.UtcNow.ToString("o"), dateIso, identifier, bankAccount, assignedStr, "MF_FALLBACK"));
+
             return Results.Content(cachedJson, "application/json", statusCode: 200);
         }
 
         var client = _httpClientFactory.CreateClient("MfApi");
         string url = $"api/check/{idType}/{identifier}/bank-account/{bankAccount}?date={dateIso}";
-        using var response = await client.GetAsync(url, ct);
-        string content = await response.Content.ReadAsStringAsync(ct);
-
-        if (response.IsSuccessStatusCode)
+        try
         {
-            _fallbackCache.Set(cacheKey, content, new MemoryCacheEntryOptions
+            using var response = await client.GetAsync(url, ct);
+            string content = await response.Content.ReadAsStringAsync(ct);
+
+            if (response.IsSuccessStatusCode)
             {
-                AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(6),
-                Size = 1
-            });
+                var (mfReqId, mfAssigned, _) = ParseMfResponse(content);
+                string auditReqId = !string.IsNullOrEmpty(mfReqId) ? mfReqId : Guid.NewGuid().ToString("N")[..18];
+                string assignedStr = !string.IsNullOrEmpty(mfAssigned) ? mfAssigned : "NIE";
 
-            _auditChannel.Enqueue(new AuditLogEntry(
-                "MF_RESPONSE", DateTime.UtcNow.ToString("o"), dateIso, identifier, bankAccount, "FROM_MF", "MF_FALLBACK"));
+                _fallbackCache.Set(cacheKey, content, new MemoryCacheEntryOptions
+                {
+                    AbsoluteExpirationRelativeToNow = TimeSpan.FromHours(6),
+                    Size = 1
+                });
+
+                _auditChannel.Enqueue(new AuditLogEntry(
+                    auditReqId, DateTime.UtcNow.ToString("o"), dateIso, identifier, bankAccount, assignedStr, "MF_FALLBACK"));
+            }
+
+            return Results.Content(content, "application/json", statusCode: (int)response.StatusCode);
         }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            _logger.LogError(ex, "Błąd komunikacji z oficjalnym API MF ({Url}).", url);
+            return Results.Json(new
+            {
+                code = "WL-500",
+                message = "Błąd komunikacji z bramką Ministerstwa Finansów."
+            }, statusCode: StatusCodes.Status502BadGateway);
+        }
+    }
 
-        return Results.Content(content, "application/json", statusCode: (int)response.StatusCode);
+    private static (string RequestId, string AccountAssigned, string RequestDateTime) ParseMfResponse(string json)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            if (doc.RootElement.TryGetProperty("result", out var resultProp))
+            {
+                string reqId = resultProp.TryGetProperty("requestId", out var rId) ? rId.GetString() ?? "" : "";
+                string assigned = resultProp.TryGetProperty("accountAssigned", out var acc) ? acc.GetString() ?? "" : "";
+                string reqDt = resultProp.TryGetProperty("requestDateTime", out var dt) ? dt.GetString() ?? "" : "";
+                return (reqId, assigned, reqDt);
+            }
+        }
+        catch { }
+        return ("", "", "");
     }
 
     public void Dispose()

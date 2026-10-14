@@ -1,0 +1,51 @@
+## Build Results
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+## Visual Studio & VS Code
+.vs/
+.vscode/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## JetBrains Rider
+.idea/
+*.sln.iml
+
+## Test Results & Coverage
+TestResults/
+[Tt]est[Rr]esults/
+coverage/
+*.coverage
+*.coveragexml
+
+## Temporary & Cache Files
+*.tmp
+*.temp
+*.log
+*.pid
+.dotnet/
+project.lock.json
+project.fragment.lock.json
+artifacts/
+
+## Environment & Secrets (Local Overrides)
+appsettings.Development.json
+appsettings.Local.json
+*.local.json
+.env
+.env.*
+
+## Local Data & Storage
+whitelist_data/
+*.bin
+*.7z
+*.jsonl
+
+## OS Generated Files
+.DS_Store
+Thumbs.db

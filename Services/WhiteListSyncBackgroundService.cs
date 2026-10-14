@@ -4,7 +4,7 @@ using Azure.Storage.Blobs;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using SharpCompress.Archives.SevenZip;
+using SharpCompress.Archives;
 using WhiteListApi.Storage;
 
 public sealed class WhiteListSyncBackgroundService : BackgroundService
@@ -34,6 +34,12 @@ public sealed class WhiteListSyncBackgroundService : BackgroundService
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         await Task.Yield();
+        if (_blobContainer is not null)
+        {
+            try { await _blobContainer.CreateIfNotExistsAsync(cancellationToken: stoppingToken); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { _logger.LogWarning(ex, "Ostrzeżenie podczas inicjalizacji kontenera Blob."); }
+        }
+
         while (!stoppingToken.IsCancellationRequested)
         {
             bool success = await SyncLastThreeDaysAsync(stoppingToken);
@@ -74,11 +80,30 @@ public sealed class WhiteListSyncBackgroundService : BackgroundService
     public async Task<bool> TryLoadDayAsync(string dateIso, string rawDate, CancellationToken ct)
     {
         string finalBinPath = Path.Combine(_dataDir, $"{rawDate}.bin");
+        string localMetaPath = Path.Combine(_dataDir, $"{rawDate}.meta.json");
         string temp7z = Path.Combine(_dataDir, $"{rawDate}.7z.tmp");
         string tempBin = Path.Combine(_dataDir, $"{rawDate}.bin.tmp");
 
         try
         {
+            if (File.Exists(finalBinPath) && File.Exists(localMetaPath))
+            {
+                try
+                {
+                    string metaJson = await File.ReadAllTextAsync(localMetaPath, ct);
+                    var localMeta = System.Text.Json.JsonSerializer.Deserialize<ParsedFlatFileMetadata>(metaJson);
+                    if (localMeta is not null)
+                    {
+                        _manager.RegisterOrUpdateDay(dateIso, finalBinPath, localMeta.Iterations, localMeta.Masks);
+                        return true;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Błąd odczytu lokalnego pliku meta dla {Date}.", dateIso);
+                }
+            }
+
             if (_blobContainer is not null)
             {
                 var binBlob = _blobContainer.GetBlobClient($"{rawDate}.bin");
@@ -88,6 +113,7 @@ public sealed class WhiteListSyncBackgroundService : BackgroundService
                     await binBlob.DownloadToAsync(finalBinPath, ct);
                     var metaDownload = await metaBlob.DownloadContentAsync(ct);
                     var meta = metaDownload.Value.Content.ToObjectFromJson<ParsedFlatFileMetadata>()!;
+                    await File.WriteAllTextAsync(localMetaPath, metaDownload.Value.Content.ToString(), ct);
                     _manager.RegisterOrUpdateDay(dateIso, finalBinPath, meta.Iterations, meta.Masks);
                     return true;
                 }
@@ -102,7 +128,7 @@ public sealed class WhiteListSyncBackgroundService : BackgroundService
                 await resp.Content.CopyToAsync(fs, ct);
 
             ParsedFlatFileMetadata newMeta;
-            using (var archive = SevenZipArchive.Open(temp7z))
+            using (var archive = ArchiveFactory.OpenArchive(temp7z))
             {
                 var entry = archive.Entries.First(e => !e.IsDirectory);
                 await using var stream = entry.OpenEntryStream();
@@ -110,6 +136,7 @@ public sealed class WhiteListSyncBackgroundService : BackgroundService
             }
             File.Delete(temp7z);
             File.Move(tempBin, finalBinPath, overwrite: true);
+            await File.WriteAllTextAsync(localMetaPath, System.Text.Json.JsonSerializer.Serialize(newMeta), ct);
 
             if (_blobContainer is not null)
             {
