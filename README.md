@@ -248,6 +248,39 @@ CLIENT_QUOTAS="erp:5000,biuro-abc:12000" \
 ```
 Skrypt tworzy konto Azure Storage (Blob + Table), kontener `whitelist` i tabelę audytu, a następnie konfiguruje adresy URI oraz uprawnienia Managed Identity. Podaj `STORAGE_ACCOUNT`, aby ustalić nazwę tworzonego konta; pominięcie zmiennej powoduje wygenerowanie nazwy unikalnej. `CLIENT_QUOTAS` pozwala przekazać własne klucze i dzienne limity podczas instalacji; wartości domyślne to `erp-standard:5000,erp-premium:50000`.
 
+Parametr `DEPLOY_MODE` wybiera sposób wdrożenia:
+* `source` (domyślnie) – buduje i wdraża projekt ze źródeł przez `az containerapp up`.
+* `image` – wdraża istniejący obraz z ACR lub Docker Hub. Obraz musi już być opublikowany.
+* `build-image` – buduje obraz na podstawie `Dockerfile` przez `az acr build`, publikuje go w ACR i wdraża. Azure wykonuje budowanie w ACR, więc lokalny Docker nie jest wymagany.
+
+Przykłady dla Bash:
+```bash
+# Gotowy obraz w istniejącym ACR
+DEPLOY_MODE=image \
+IMAGE="mojrejestr.azurecr.io/whitelist-api:v1.2.0" \
+ACR_RESOURCE_GROUP="rg-rejestru" \
+./scripts/deploy-azure.sh
+
+# Zbudowanie, opublikowanie i wdrożenie nowego obrazu
+DEPLOY_MODE=build-image \
+ACR_NAME="mojrejestr" \
+ACR_RESOURCE_GROUP="rg-rejestru" \
+IMAGE_TAG="v1.2.0" \
+./scripts/deploy-azure.sh
+
+# Wdrożenie obrazu opublikowanego przez GitHub Actions na Docker Hub
+DEPLOY_MODE=image \
+IMAGE="docker.io/mojekonto/whitelist-api:sha-<commit>" \
+./scripts/deploy-azure.sh
+```
+
+Odpowiedniki parametrów PowerShell to `-DeployMode image -Image "mojrejestr.azurecr.io/whitelist-api:v1.2.0" -AcrResourceGroup "rg-rejestru"` oraz `-DeployMode build-image -AcrName "mojrejestr" -AcrResourceGroup "rg-rejestru" -ImageTag "v1.2.0"`. Docker Hub można wdrożyć przez `-DeployMode image -Image "docker.io/mojekonto/whitelist-api:sha-<commit>"`. Przy `build-image` skrypt utworzy rejestr ACR w podanej grupie zasobów, jeśli jeszcze nie istnieje; jego nazwa musi być globalnie unikalna. Dla ACR skrypt nadaje dedykowanej Managed Identity rolę `AcrPull`; Docker Hub używa publicznego pulla albo podanych poświadczeń. `ACR_RESOURCE_GROUP` (`-AcrResourceGroup`) domyślnie przyjmuje wartość `RESOURCE_GROUP` (`-ResourceGroup`).
+
+#### Budowanie i publikowanie na Docker Hub przez GitHub Actions
+Workflow `.github/workflows/dockerhub-publish.yml` uruchamia testy, buduje obraz z `Dockerfile` i publikuje go na Docker Hub. Dodaj w ustawieniach repozytorium GitHub sekrety `DOCKERHUB_USERNAME` oraz `DOCKERHUB_TOKEN` (token Docker Hub z prawem zapisu). Push do `main` publikuje tag `latest` i tag SHA commita; tag `v*` publikuje dodatkowo tag wersji. Obraz budowany jest dla `linux/amd64`, zgodnie z hostowanym środowiskiem Azure Container Apps.
+
+Po publikacji można uruchomić skrypt wdrożeniowy bez checkoutu projektu, podając jedynie opublikowany obraz oraz wymagane parametry Azure. Do publicznego repozytorium Docker Hub nie potrzeba credentiali. Dla prywatnego repozytorium ustaw `DOCKERHUB_USERNAME` i `DOCKERHUB_TOKEN` w środowisku uruchomienia skryptu albo użyj parametrów PowerShell `-DockerHubUsername` i `-DockerHubToken`; token nie jest wypisywany przez skrypt. Skrypt nadal potrzebuje Azure CLI (`az`) i zalogowanej subskrypcji.
+
 #### Dla systemu Windows (PowerShell):
 Skrypt `scripts/deploy-azure.ps1` działa w PowerShell 5.1 oraz PowerShell 7+:
 ```powershell

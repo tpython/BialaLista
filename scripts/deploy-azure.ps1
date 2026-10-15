@@ -16,7 +16,14 @@ param(
     [string]$StorageAccount = '',
     [string]$BlobContainerName = 'whitelist',
     [string]$AuditTableName = 'whitelistAudit',
-    [string]$ClientQuotas = 'erp-standard:5000,erp-premium:50000'
+    [string]$ClientQuotas = 'erp-standard:5000,erp-premium:50000',
+    [ValidateSet('source', 'image', 'build-image')][string]$DeployMode = 'source',
+    [string]$AcrName = '',
+    [string]$AcrResourceGroup = '',
+    [string]$Image = '',
+    [string]$ImageTag = '',
+    [string]$DockerHubUsername = $env:DOCKERHUB_USERNAME,
+    [string]$DockerHubToken = $env:DOCKERHUB_TOKEN
 )
 
 $ErrorActionPreference = 'Stop'
@@ -61,6 +68,36 @@ if ($StorageAccount -cnotmatch '^[a-z0-9]{3,24}$') {
 if ($AuditTableName -cnotmatch '^[A-Za-z][A-Za-z0-9]{2,62}$') {
     throw 'AuditTableName: 3-63 znaki, tylko litery i cyfry, pierwszy znak litera.'
 }
+$imageRegistry = ''
+if ($DeployMode -eq 'image') {
+    if ($Image -cmatch '^([a-z0-9]{5,50})\.azurecr\.io/.+') {
+        $imageRegistry = 'acr'
+        $AcrName = $Matches[1]
+    } elseif ($Image -match '^((docker\.io|index\.docker\.io)/)?[a-z0-9][a-z0-9_.-]*/[a-z0-9][a-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$') {
+        $imageRegistry = 'dockerhub'
+    } else {
+        throw 'Dla DeployMode=image podaj obraz z ACR lub Docker Hub, np. docker.io/firma/whitelist-api:v1.'
+    }
+}
+if ($DeployMode -eq 'build-image' -and [string]::IsNullOrWhiteSpace($AcrName)) {
+    throw 'Dla DeployMode=build-image podaj unikalna nazwe ACR przez -AcrName.'
+}
+if (($DeployMode -eq 'build-image' -or $imageRegistry -eq 'acr') -and $AcrName -cnotmatch '^[a-z0-9]{5,50}$') {
+    throw 'AcrName musi miec 5-50 znakow alfanumerycznych.'
+}
+if ($DeployMode -eq 'image' -and [string]::IsNullOrWhiteSpace($Image)) {
+    throw 'Dla DeployMode=image podaj -Image.'
+}
+if ($imageRegistry -eq 'dockerhub' -and
+    ([string]::IsNullOrWhiteSpace($DockerHubUsername) -xor [string]::IsNullOrWhiteSpace($DockerHubToken))) {
+    throw 'Dla prywatnego Docker Hub podaj oba: -DockerHubUsername i -DockerHubToken.'
+}
+if ([string]::IsNullOrWhiteSpace($ImageTag)) {
+    $ImageTag = Get-Date -Format 'yyyyMMddHHmmss'
+}
+if ([string]::IsNullOrWhiteSpace($AcrResourceGroup)) {
+    $AcrResourceGroup = $ResourceGroup
+}
 
 Write-Host '============================================================' -ForegroundColor Cyan
 Write-Host 'Wdrozenie WhiteListApi do Azure Container Apps' -ForegroundColor Cyan
@@ -91,7 +128,8 @@ $requiredProviders = @(
     "Microsoft.Storage",
     "Microsoft.App",
     "Microsoft.OperationalInsights",
-    "Microsoft.ContainerRegistry"
+    "Microsoft.ContainerRegistry",
+    "Microsoft.ManagedIdentity"
 )
 
 foreach ($provider in $requiredProviders) {
@@ -180,26 +218,154 @@ if (-not $environmentExists) {
     Write-Host 'Container Apps Environment juz istnieje - wykorzystuje je.' -ForegroundColor Green
 }
 
-Write-Host '[5/6] Budowanie aplikacji i konfiguracja skalowania...' -ForegroundColor Yellow
+Write-Host '[5/6] Budowanie obrazu / wdrazanie aplikacji...' -ForegroundColor Yellow
 $rootDir = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
-Invoke-AzChecked 'Budowanie i wdrazanie aplikacji ze zrodel' @(
-    'containerapp', 'up',
-    '--name', $ContainerAppName,
-    '--resource-group', $ResourceGroup,
-    '--location', $Location,
-    '--environment', $EnvironmentName,
-    '--source', $rootDir,
-    '--target-port', '8080',
-    '--ingress', 'external',
-    '--env-vars',
-        "BLOB_STORAGE_URI=https://$StorageAccount.blob.core.windows.net/$BlobContainerName",
-        "TABLE_STORAGE_URI=https://$StorageAccount.table.core.windows.net/",
-        "AUDIT_TABLE_NAME=$AuditTableName",
-        "CLIENT_QUOTAS=$ClientQuotas",
-        'TZ=Europe/Warsaw',
-        'DOTNET_GCHeapHardLimit=0x30000000'
-)
+if ($DeployMode -eq 'source') {
+    Invoke-AzChecked 'Budowanie i wdrazanie aplikacji ze zrodel' @(
+        'containerapp', 'up',
+        '--name', $ContainerAppName,
+        '--resource-group', $ResourceGroup,
+        '--location', $Location,
+        '--environment', $EnvironmentName,
+        '--source', $rootDir,
+        '--target-port', '8080',
+        '--ingress', 'external',
+        '--env-vars',
+            "BLOB_STORAGE_URI=https://$StorageAccount.blob.core.windows.net/$BlobContainerName",
+            "TABLE_STORAGE_URI=https://$StorageAccount.table.core.windows.net/",
+            "AUDIT_TABLE_NAME=$AuditTableName",
+            "CLIENT_QUOTAS=$ClientQuotas",
+            'TZ=Europe/Warsaw',
+            'DOTNET_GCHeapHardLimit=0x30000000'
+    )
+} else {
+    if ($DeployMode -eq 'build-image') {
+        $existingAcr = az acr show --name $AcrName --resource-group $AcrResourceGroup --query name -o tsv 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Invoke-AzChecked 'Tworzenie Azure Container Registry' @(
+            'acr', 'create', '--name', $AcrName, '--resource-group', $AcrResourceGroup,
+                '--location', $Location, '--sku', 'Basic', '--admin-enabled', 'false', '-o', 'none'
+            )
+        }
+        $Image = "$AcrName.azurecr.io/whitelist-api:$ImageTag"
+        $imageRegistry = 'acr'
+        Invoke-AzChecked 'Budowanie i publikowanie obrazu Docker w ACR' @(
+            'acr', 'build', '--registry', $AcrName, '--image', "whitelist-api:$ImageTag", $rootDir
+        )
+    }
+
+    if ($imageRegistry -eq 'acr') {
+    $acrId = Get-AzValue 'Pobieranie identyfikatora ACR' @(
+        'acr', 'show', '--name', $AcrName, '--resource-group', $AcrResourceGroup, '--query', 'id', '-o', 'tsv'
+    )
+    $acrServer = "$AcrName.azurecr.io"
+    $pullIdentityName = "$ContainerAppName-acr-pull"
+    $existingIdentity = az identity show --name $pullIdentityName --resource-group $ResourceGroup --query name -o tsv 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Invoke-AzChecked 'Tworzenie Managed Identity do pobierania obrazu' @(
+            'identity', 'create', '--name', $pullIdentityName,
+            '--resource-group', $ResourceGroup, '--location', $Location, '-o', 'none'
+        )
+    }
+    $pullIdentityId = Get-AzValue 'Pobieranie Managed Identity ACR' @(
+        'identity', 'show', '--name', $pullIdentityName, '--resource-group', $ResourceGroup, '--query', 'id', '-o', 'tsv'
+    )
+    $pullPrincipalId = Get-AzValue 'Pobieranie Principal ID ACR' @(
+        'identity', 'show', '--name', $pullIdentityName, '--resource-group', $ResourceGroup, '--query', 'principalId', '-o', 'tsv'
+    )
+    $acrRoles = Get-AzValue 'Sprawdzanie roli AcrPull' @(
+        'role', 'assignment', 'list', '--scope', $acrId,
+        '--query', "[?principalId=='$pullPrincipalId'].roleDefinitionName", '-o', 'tsv'
+    )
+    if (@($acrRoles -split "`r?`n") -notcontains 'AcrPull') {
+        Invoke-AzChecked 'Nadawanie roli AcrPull' @(
+            'role', 'assignment', 'create',
+            '--assignee-object-id', $pullPrincipalId,
+            '--assignee-principal-type', 'ServicePrincipal',
+            '--role', 'AcrPull', '--scope', $acrId, '-o', 'none'
+        )
+    }
+
+    $existingApp = az containerapp show --name $ContainerAppName --resource-group $ResourceGroup --query name -o tsv 2>$null
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($existingApp)) {
+        Invoke-AzChecked 'Przypisanie tozsamosci do pobierania obrazu' @(
+            'containerapp', 'identity', 'assign', '--name', $ContainerAppName,
+            '--resource-group', $ResourceGroup, '--system-assigned',
+            '--user-assigned', $pullIdentityId, '-o', 'none'
+        )
+        Invoke-AzChecked 'Konfiguracja rejestru obrazu' @(
+            'containerapp', 'registry', 'set', '--name', $ContainerAppName,
+            '--resource-group', $ResourceGroup, '--server', $acrServer, '--identity', $pullIdentityId
+        )
+        Invoke-AzChecked 'Aktualizacja aplikacji do obrazu z ACR' @(
+            'containerapp', 'update', '--name', $ContainerAppName,
+            '--resource-group', $ResourceGroup, '--image', $Image, '--set-env-vars',
+            "BLOB_STORAGE_URI=https://$StorageAccount.blob.core.windows.net/$BlobContainerName",
+            "TABLE_STORAGE_URI=https://$StorageAccount.table.core.windows.net/",
+            "AUDIT_TABLE_NAME=$AuditTableName", "CLIENT_QUOTAS=$ClientQuotas",
+            'TZ=Europe/Warsaw', 'DOTNET_GCHeapHardLimit=0x30000000'
+        )
+    } else {
+        Invoke-AzChecked 'Utworzenie aplikacji z obrazem ACR' @(
+            'containerapp', 'create', '--name', $ContainerAppName,
+            '--resource-group', $ResourceGroup, '--environment', $EnvironmentName,
+            '--image', $Image, '--target-port', '8080', '--ingress', 'external',
+            '--system-assigned', '--user-assigned', $pullIdentityId,
+            '--registry-server', $acrServer, '--registry-identity', $pullIdentityId,
+            '--env-vars',
+            "BLOB_STORAGE_URI=https://$StorageAccount.blob.core.windows.net/$BlobContainerName",
+            "TABLE_STORAGE_URI=https://$StorageAccount.table.core.windows.net/",
+            "AUDIT_TABLE_NAME=$AuditTableName", "CLIENT_QUOTAS=$ClientQuotas",
+            'TZ=Europe/Warsaw', 'DOTNET_GCHeapHardLimit=0x30000000', '-o', 'none'
+        )
+    }
+    } else {
+        $dockerHubServer = 'index.docker.io'
+        $registryArguments = @()
+        if (-not [string]::IsNullOrWhiteSpace($DockerHubUsername)) {
+            $registryArguments = @(
+                '--registry-server', $dockerHubServer,
+                '--registry-username', $DockerHubUsername,
+                '--registry-password', $DockerHubToken
+            )
+        }
+
+        $existingApp = az containerapp show --name $ContainerAppName --resource-group $ResourceGroup --query name -o tsv 2>$null
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($existingApp)) {
+            if (-not [string]::IsNullOrWhiteSpace($DockerHubUsername)) {
+                Invoke-AzChecked 'Konfiguracja prywatnego repozytorium Docker Hub' @(
+                    'containerapp', 'registry', 'set', '--name', $ContainerAppName,
+                    '--resource-group', $ResourceGroup, '--server', $dockerHubServer,
+                    '--username', $DockerHubUsername, '--password', $DockerHubToken
+                )
+            }
+            Invoke-AzChecked 'Aktualizacja aplikacji do obrazu Docker Hub' @(
+                'containerapp', 'update', '--name', $ContainerAppName,
+                '--resource-group', $ResourceGroup, '--image', $Image, '--set-env-vars',
+                "BLOB_STORAGE_URI=https://$StorageAccount.blob.core.windows.net/$BlobContainerName",
+                "TABLE_STORAGE_URI=https://$StorageAccount.table.core.windows.net/",
+                "AUDIT_TABLE_NAME=$AuditTableName", "CLIENT_QUOTAS=$ClientQuotas",
+                'TZ=Europe/Warsaw', 'DOTNET_GCHeapHardLimit=0x30000000'
+            )
+        } else {
+            $createArguments = @(
+                'containerapp', 'create', '--name', $ContainerAppName,
+                '--resource-group', $ResourceGroup, '--environment', $EnvironmentName,
+                '--image', $Image, '--target-port', '8080', '--ingress', 'external',
+                '--system-assigned'
+            ) + $registryArguments + @(
+                '--env-vars',
+                "BLOB_STORAGE_URI=https://$StorageAccount.blob.core.windows.net/$BlobContainerName",
+                "TABLE_STORAGE_URI=https://$StorageAccount.table.core.windows.net/",
+                "AUDIT_TABLE_NAME=$AuditTableName", "CLIENT_QUOTAS=$ClientQuotas",
+                'TZ=Europe/Warsaw', 'DOTNET_GCHeapHardLimit=0x30000000', '-o', 'none'
+            )
+            Invoke-AzChecked 'Utworzenie aplikacji z obrazem Docker Hub' $createArguments
+        }
+    }
+    Write-Host "Uzywany obraz: $Image" -ForegroundColor Green
+}
 
 Write-Host '[6/6] Managed Identity i RBAC...' -ForegroundColor Yellow
 # Podstawowa wersja "az containerapp up" nie obsluguje --system-assigned.

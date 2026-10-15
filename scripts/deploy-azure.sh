@@ -12,6 +12,46 @@ ENVIRONMENT_NAME="${ENVIRONMENT_NAME:-cae-whitelist-env}"
 BLOB_CONTAINER_NAME="${BLOB_CONTAINER_NAME:-whitelist}"
 AUDIT_TABLE_NAME="${AUDIT_TABLE_NAME:-whitelistAudit}"
 CLIENT_QUOTAS="${CLIENT_QUOTAS:-erp-standard:5000,erp-premium:50000}"
+DEPLOY_MODE="${DEPLOY_MODE:-source}"
+ACR_NAME="${ACR_NAME:-}"
+ACR_RESOURCE_GROUP="${ACR_RESOURCE_GROUP:-$RESOURCE_GROUP}"
+IMAGE="${IMAGE:-}"
+IMAGE_TAG="${IMAGE_TAG:-$(date -u +%Y%m%d%H%M%S)}"
+DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:-}"
+DOCKERHUB_TOKEN="${DOCKERHUB_TOKEN:-}"
+IMAGE_REGISTRY=""
+
+if [[ "$DEPLOY_MODE" != "source" && "$DEPLOY_MODE" != "image" && "$DEPLOY_MODE" != "build-image" ]]; then
+  echo "BŁĄD: DEPLOY_MODE musi mieć wartość source, image lub build-image." >&2
+  exit 1
+fi
+if [[ "$DEPLOY_MODE" == "image" ]]; then
+  if [[ "$IMAGE" =~ ^([a-z0-9]{5,50})\.azurecr\.io/.+ ]]; then
+    ACR_NAME="${BASH_REMATCH[1]}"
+    IMAGE_REGISTRY="acr"
+  elif [[ "$IMAGE" =~ ^(docker\.io/|index\.docker\.io/)?[a-z0-9][a-z0-9_.-]*/[a-z0-9][a-z0-9_.-]*(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,127})?$ ]]; then
+    IMAGE_REGISTRY="dockerhub"
+  else
+    echo "BŁĄD: IMAGE musi wskazywać obraz w ACR lub Docker Hub, np. docker.io/firma/whitelist-api:v1." >&2
+    exit 1
+  fi
+fi
+if [[ "$DEPLOY_MODE" == "build-image" && -z "$ACR_NAME" ]]; then
+  echo "BŁĄD: Dla DEPLOY_MODE=build-image podaj unikalną nazwę ACR przez ACR_NAME." >&2
+  exit 1
+fi
+if [[ ( "$DEPLOY_MODE" == "build-image" || "$IMAGE_REGISTRY" == "acr" ) && ! "$ACR_NAME" =~ ^[a-z0-9]{5,50}$ ]]; then
+  echo "BŁĄD: ACR_NAME musi mieć 5-50 znaków alfanumerycznych." >&2
+  exit 1
+fi
+if [[ "$DEPLOY_MODE" == "image" && -z "$IMAGE" ]]; then
+  echo "BŁĄD: Dla DEPLOY_MODE=image podaj IMAGE." >&2
+  exit 1
+fi
+if [[ "$IMAGE_REGISTRY" == "dockerhub" && ( -n "$DOCKERHUB_USERNAME" || -n "$DOCKERHUB_TOKEN" ) && ( -z "$DOCKERHUB_USERNAME" || -z "$DOCKERHUB_TOKEN" ) ]]; then
+  echo "BŁĄD: Dla prywatnego Docker Hub podaj oba: DOCKERHUB_USERNAME i DOCKERHUB_TOKEN." >&2
+  exit 1
+fi
 
 # Generowanie unikalnej nazwy Storage Account jeśli nie podano
 if [[ -z "${STORAGE_ACCOUNT:-}" ]]; then
@@ -91,6 +131,7 @@ REQUIRED_PROVIDERS=(
   "Microsoft.App"
   "Microsoft.OperationalInsights"
   "Microsoft.ContainerRegistry"
+  "Microsoft.ManagedIdentity"
 )
 
 for provider in "${REQUIRED_PROVIDERS[@]}"; do
@@ -159,24 +200,125 @@ else
     --location "$LOCATION" -o none
 fi
 
-echo "[5/6] Budowanie aplikacji i konfiguracja skalowania..."
+echo "[5/6] Budowanie obrazu / wdrażanie aplikacji..."
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-az_checked 'Budowanie i wdrażanie aplikacji ze źródeł' containerapp up \
-  --name "${CONTAINER_APP_NAME}" \
-  --resource-group "${RESOURCE_GROUP}" \
-  --location "${LOCATION}" \
-  --environment "${ENVIRONMENT_NAME}" \
-  --source "${ROOT_DIR}" \
-  --target-port 8080 \
-  --ingress external \
-  --env-vars \
-    BLOB_STORAGE_URI="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${BLOB_CONTAINER_NAME}" \
-    TABLE_STORAGE_URI="https://${STORAGE_ACCOUNT}.table.core.windows.net/" \
-    AUDIT_TABLE_NAME="${AUDIT_TABLE_NAME}" \
-    CLIENT_QUOTAS="${CLIENT_QUOTAS}" \
-    TZ=Europe/Warsaw \
-    DOTNET_GCHeapHardLimit=0x30000000
+if [[ "$DEPLOY_MODE" == "source" ]]; then
+  az_checked 'Budowanie i wdrażanie aplikacji ze źródeł' containerapp up \
+    --name "${CONTAINER_APP_NAME}" \
+    --resource-group "${RESOURCE_GROUP}" \
+    --location "${LOCATION}" \
+    --environment "${ENVIRONMENT_NAME}" \
+    --source "${ROOT_DIR}" \
+    --target-port 8080 \
+    --ingress external \
+    --env-vars \
+      BLOB_STORAGE_URI="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${BLOB_CONTAINER_NAME}" \
+      TABLE_STORAGE_URI="https://${STORAGE_ACCOUNT}.table.core.windows.net/" \
+      AUDIT_TABLE_NAME="${AUDIT_TABLE_NAME}" \
+      CLIENT_QUOTAS="${CLIENT_QUOTAS}" \
+      TZ=Europe/Warsaw \
+      DOTNET_GCHeapHardLimit=0x30000000
+else
+  if [[ "$DEPLOY_MODE" == "build-image" ]]; then
+    if ! az acr show --name "$ACR_NAME" --resource-group "$ACR_RESOURCE_GROUP" -o none 2>/dev/null; then
+      az_checked 'Tworzenie Azure Container Registry' acr create \
+        --name "$ACR_NAME" --resource-group "$ACR_RESOURCE_GROUP" \
+        --location "$LOCATION" --sku Basic --admin-enabled false -o none
+    fi
+    IMAGE="${ACR_NAME}.azurecr.io/whitelist-api:${IMAGE_TAG}"
+    az_checked 'Budowanie i publikowanie obrazu Docker w ACR' acr build \
+      --registry "$ACR_NAME" --image "whitelist-api:${IMAGE_TAG}" "$ROOT_DIR"
+    IMAGE_REGISTRY="acr"
+  fi
+
+  if [[ "$IMAGE_REGISTRY" == "acr" ]]; then
+  ACR_ID=$(az_value 'Pobieranie identyfikatora ACR' acr show \
+    --name "$ACR_NAME" --resource-group "$ACR_RESOURCE_GROUP" --query id -o tsv)
+  ACR_SERVER="${ACR_NAME}.azurecr.io"
+  PULL_IDENTITY_NAME="${CONTAINER_APP_NAME}-acr-pull"
+  if ! az identity show --name "$PULL_IDENTITY_NAME" --resource-group "$RESOURCE_GROUP" -o none 2>/dev/null; then
+    az_checked 'Tworzenie Managed Identity do pobierania obrazu' identity create \
+      --name "$PULL_IDENTITY_NAME" --resource-group "$RESOURCE_GROUP" \
+      --location "$LOCATION" -o none
+  fi
+  PULL_IDENTITY_ID=$(az_value 'Pobieranie Managed Identity ACR' identity show \
+    --name "$PULL_IDENTITY_NAME" --resource-group "$RESOURCE_GROUP" --query id -o tsv)
+  PULL_PRINCIPAL_ID=$(az_value 'Pobieranie Principal ID ACR' identity show \
+    --name "$PULL_IDENTITY_NAME" --resource-group "$RESOURCE_GROUP" --query principalId -o tsv)
+  ACR_ROLES=$(az_value 'Sprawdzanie roli AcrPull' role assignment list \
+    --scope "$ACR_ID" --query "[?principalId=='${PULL_PRINCIPAL_ID}'].roleDefinitionName" -o tsv)
+  if [[ $'\n'"$ACR_ROLES"$'\n' != *$'\n'AcrPull$'\n'* ]]; then
+    az_checked 'Nadawanie roli AcrPull' role assignment create \
+      --assignee-object-id "$PULL_PRINCIPAL_ID" \
+      --assignee-principal-type ServicePrincipal \
+      --role AcrPull --scope "$ACR_ID" -o none
+  fi
+
+  if az containerapp show --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" -o none 2>/dev/null; then
+    az_checked 'Przypisanie tożsamości do pobierania obrazu' containerapp identity assign \
+      --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
+      --system-assigned --user-assigned "$PULL_IDENTITY_ID" -o none
+    az_checked 'Konfiguracja rejestru obrazu' containerapp registry set \
+      --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
+      --server "$ACR_SERVER" --identity "$PULL_IDENTITY_ID"
+    az_checked 'Aktualizacja aplikacji do obrazu z ACR' containerapp update \
+      --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
+      --image "$IMAGE" --set-env-vars \
+        BLOB_STORAGE_URI="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${BLOB_CONTAINER_NAME}" \
+        TABLE_STORAGE_URI="https://${STORAGE_ACCOUNT}.table.core.windows.net/" \
+        AUDIT_TABLE_NAME="${AUDIT_TABLE_NAME}" CLIENT_QUOTAS="${CLIENT_QUOTAS}" \
+        TZ=Europe/Warsaw DOTNET_GCHeapHardLimit=0x30000000
+  else
+    az_checked 'Utworzenie aplikacji z obrazem ACR' containerapp create \
+      --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
+      --environment "$ENVIRONMENT_NAME" --image "$IMAGE" \
+      --target-port 8080 --ingress external \
+      --system-assigned --user-assigned "$PULL_IDENTITY_ID" \
+      --registry-server "$ACR_SERVER" --registry-identity "$PULL_IDENTITY_ID" \
+      --env-vars \
+        BLOB_STORAGE_URI="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${BLOB_CONTAINER_NAME}" \
+        TABLE_STORAGE_URI="https://${STORAGE_ACCOUNT}.table.core.windows.net/" \
+        AUDIT_TABLE_NAME="${AUDIT_TABLE_NAME}" CLIENT_QUOTAS="${CLIENT_QUOTAS}" \
+        TZ=Europe/Warsaw DOTNET_GCHeapHardLimit=0x30000000 -o none
+  fi
+  else
+    DOCKERHUB_SERVER="index.docker.io"
+    REGISTRY_ARGS=()
+    if [[ -n "$DOCKERHUB_USERNAME" ]]; then
+      REGISTRY_ARGS+=(--registry-server "$DOCKERHUB_SERVER" \
+        --registry-username "$DOCKERHUB_USERNAME" --registry-password "$DOCKERHUB_TOKEN")
+    fi
+
+    if az containerapp show --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" -o none 2>/dev/null; then
+      if [[ -n "$DOCKERHUB_USERNAME" ]]; then
+        az_checked 'Konfiguracja prywatnego repozytorium Docker Hub' containerapp registry set \
+          --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
+          --server "$DOCKERHUB_SERVER" --username "$DOCKERHUB_USERNAME" \
+          --password "$DOCKERHUB_TOKEN"
+      fi
+      az_checked 'Aktualizacja aplikacji do obrazu Docker Hub' containerapp update \
+        --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
+        --image "$IMAGE" --set-env-vars \
+          BLOB_STORAGE_URI="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${BLOB_CONTAINER_NAME}" \
+          TABLE_STORAGE_URI="https://${STORAGE_ACCOUNT}.table.core.windows.net/" \
+          AUDIT_TABLE_NAME="${AUDIT_TABLE_NAME}" CLIENT_QUOTAS="${CLIENT_QUOTAS}" \
+          TZ=Europe/Warsaw DOTNET_GCHeapHardLimit=0x30000000
+    else
+      az_checked 'Utworzenie aplikacji z obrazem Docker Hub' containerapp create \
+        --name "$CONTAINER_APP_NAME" --resource-group "$RESOURCE_GROUP" \
+        --environment "$ENVIRONMENT_NAME" --image "$IMAGE" \
+        --target-port 8080 --ingress external --system-assigned \
+        "${REGISTRY_ARGS[@]}" \
+        --env-vars \
+          BLOB_STORAGE_URI="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${BLOB_CONTAINER_NAME}" \
+          TABLE_STORAGE_URI="https://${STORAGE_ACCOUNT}.table.core.windows.net/" \
+          AUDIT_TABLE_NAME="${AUDIT_TABLE_NAME}" CLIENT_QUOTAS="${CLIENT_QUOTAS}" \
+          TZ=Europe/Warsaw DOTNET_GCHeapHardLimit=0x30000000 -o none
+    fi
+  fi
+  echo "Używany obraz: ${IMAGE}"
+fi
 
 echo "[6/6] Managed Identity i RBAC..."
 az_checked 'Przypisanie system-assigned Managed Identity' containerapp identity assign \
