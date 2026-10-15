@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Skrypt automatycznego wdrożenia WhiteListApi do Azure Container Apps dla Windows PowerShell / PowerShell 7.
 .DESCRIPTION
