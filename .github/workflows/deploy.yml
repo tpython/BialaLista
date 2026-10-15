@@ -1,8 +1,6 @@
 name: Deploy WhiteListApi to Azure Container Apps
 
 on:
-  push:
-    branches: [ "main" ]
   workflow_dispatch:
 
 permissions:

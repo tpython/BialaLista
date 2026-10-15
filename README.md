@@ -182,9 +182,36 @@ Konfiguracja aplikacji może być przekazywana przez plik `appsettings.json` lub
 | `BLOB_STORAGE_URI` | *(brak)* | URI kontenera Azure Blob Storage z wygenerowanymi plikami `.bin` i logami audytu. |
 | `TABLE_STORAGE_URI` | *(brak)* | URI usługi Azure Table Storage do logowania audytowego. |
 | `AUDIT_TABLE_NAME` | `whitelist_audit` | Nazwa tabeli w Table Storage. |
-| `CLIENT_QUOTAS` | *(standard=1000, premium=50000)* | Dzienne limity zapytań per klucz. Format: `klucz1:1000,klucz2:50000;klucz3=100000`. |
+| `CLIENT_QUOTAS` | `klucz-klienta-standard:1000,klucz-klienta-premium:50000` | Dzienne limity zapytań per klucz. Format: `klucz1:1000,klucz2:50000` (dozwolone są też `;` i `=`). |
 | `DOTNET_GCHeapHardLimit` | `0x30000000` (768 MB) | Twardy limit pamięci sterty GC (ochrona przed OOM w kontenerze 1.0 GiB). |
 | `TZ` | `Europe/Warsaw` | Strefa czasowa kontenera. |
+
+### 4.1. Klucze klientów i limity dzienne
+
+Wpis w `CLIENT_QUOTAS` przypisuje nazwę/klucz klienta do maksymalnej liczby zapytań na dobę. Ten sam klucz należy przekazywać w ścieżce URL `/k/{apiKey}/...` albo jako parametr `?apiKey=...`. Na przykład konfiguracja:
+
+```text
+CLIENT_QUOTAS="erp-standard:5000,erp-premium:50000,biuro-abc:12000"
+```
+
+oznacza limit 5000 zapytań dziennie dla `erp-standard`, 50000 dla `erp-premium` i 12000 dla `biuro-abc`. Separatorem par może być przecinek lub średnik, a klucz i liczbę można rozdzielić dwukropkiem albo znakiem `=`. Używaj osobnego, niepowtarzalnego klucza dla każdego klienta. Przykład wywołania:
+
+```bash
+curl "https://<adres-api>/k/biuro-abc/api/check/nip/5260250995/bank-account/02102010260000140201648043"
+```
+
+Limity można ustawić w sekcji `ClientQuotas` pliku `appsettings.json` albo przekazać jako `CLIENT_QUOTAS`. Zmienna środowiskowa nadpisuje limit o tej samej nazwie; pozostałe wpisy z `appsettings.json` nadal obowiązują. Jeżeli ustawiasz limity wyłącznie przez zmienną, usuń lub zmień domyślne wpisy w `appsettings.json`, jeśli nie mają być aktywne.
+
+W Azure Container Apps można zmienić konfigurację istniejącej aplikacji poleceniem:
+
+```bash
+az containerapp update \
+  --name ca-whitelist-api \
+  --resource-group rg-whitelist-pl \
+  --set-env-vars 'CLIENT_QUOTAS=erp-standard:5000,erp-premium:50000,biuro-abc:12000'
+```
+
+Klucz służy do identyfikacji limitu, **nie jest uwierzytelnieniem ani ochroną dostępu do API**: aplikacja nie sprawdza, czy wywołujący ma prawo użyć danego klucza. Nie umieszczaj w nim haseł ani innych sekretów; jeśli API wymaga kontroli dostępu, skonfiguruj ją dodatkowo na poziomie ingressu lub warstwy uwierzytelniania.
 
 ---
 
@@ -215,11 +242,14 @@ Opcjonalna parametryzacja:
 RESOURCE_GROUP="rg-mojafirma-whitelist" \
 LOCATION="polandcentral" \
 CONTAINER_APP_NAME="ca-whitelist-api" \
+STORAGE_ACCOUNT="stmojafirmabialalista" \
+CLIENT_QUOTAS="erp:5000,biuro-abc:12000" \
 ./scripts/deploy-azure.sh
 ```
+Skrypt tworzy konto Azure Storage (Blob + Table), kontener `whitelist` i tabelę audytu, a następnie konfiguruje adresy URI oraz uprawnienia Managed Identity. Podaj `STORAGE_ACCOUNT`, aby ustalić nazwę tworzonego konta; pominięcie zmiennej powoduje wygenerowanie nazwy unikalnej. `CLIENT_QUOTAS` pozwala przekazać własne klucze i dzienne limity podczas instalacji; wartości domyślne to `erp-standard:5000,erp-premium:50000`.
 
 #### Dla systemu Windows (PowerShell):
-Skrypt [`scripts/deploy-azure.ps1`](file:///home/tom/Pulpit/Bia%C5%82aLista/scripts/deploy-azure.ps1) działa w PowerShell 5.1 oraz PowerShell 7+:
+Skrypt `scripts/deploy-azure.ps1` działa w PowerShell 5.1 oraz PowerShell 7+:
 ```powershell
 .\scripts\deploy-azure.ps1
 ```
@@ -228,8 +258,11 @@ Opcjonalna parametryzacja przez parametry polecenia:
 .\scripts\deploy-azure.ps1 `
     -ResourceGroup "rg-mojafirma-whitelist" `
     -Location "polandcentral" `
-    -ContainerAppName "ca-whitelist-api"
+    -ContainerAppName "ca-whitelist-api" `
+    -StorageAccount "stmojafirmabialalista" `
+    -ClientQuotas "erp:5000,biuro-abc:12000"
 ```
+Parametr `-StorageAccount` ustala nazwę tworzonego konta Storage. Gdy go pominiesz, skrypt wygeneruje nazwę unikalną. Konto, kontener Blob i tabela audytu są tworzone automatycznie.
 
 ---
 
@@ -285,7 +318,7 @@ az containerapp create \
     BLOB_STORAGE_URI="https://${STORAGE_ACCOUNT}.blob.core.windows.net/whitelist" \
     TABLE_STORAGE_URI="https://${STORAGE_ACCOUNT}.table.core.windows.net/" \
     AUDIT_TABLE_NAME="whitelist_audit" \
-    CLIENT_QUOTAS="erp-standard:5000,erp-premium:50000" \
+    CLIENT_QUOTAS="erp:5000,biuro-abc:12000" \
     TZ="Europe/Warsaw" \
     DOTNET_GCHeapHardLimit="0x30000000"
 

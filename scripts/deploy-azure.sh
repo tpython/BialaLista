@@ -11,6 +11,7 @@ CONTAINER_APP_NAME="${CONTAINER_APP_NAME:-ca-whitelist-api}"
 ENVIRONMENT_NAME="${ENVIRONMENT_NAME:-cae-whitelist-env}"
 BLOB_CONTAINER_NAME="whitelist"
 AUDIT_TABLE_NAME="whitelist_audit"
+CLIENT_QUOTAS="${CLIENT_QUOTAS:-erp-standard:5000,erp-premium:50000}"
 
 # Generowanie unikalnej nazwy Storage Account jeśli nie podano
 if [[ -z "${STORAGE_ACCOUNT:-}" ]]; then
@@ -102,7 +103,7 @@ az containerapp create \
     BLOB_STORAGE_URI="https://${STORAGE_ACCOUNT}.blob.core.windows.net/${BLOB_CONTAINER_NAME}" \
     TABLE_STORAGE_URI="https://${STORAGE_ACCOUNT}.table.core.windows.net/" \
     AUDIT_TABLE_NAME="${AUDIT_TABLE_NAME}" \
-    CLIENT_QUOTAS="erp-standard:5000,erp-premium:50000" \
+    CLIENT_QUOTAS="${CLIENT_QUOTAS}" \
     TZ="Europe/Warsaw" \
     DOTNET_GCHeapHardLimit="0x30000000" \
   --output none

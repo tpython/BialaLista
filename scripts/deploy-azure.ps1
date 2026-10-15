@@ -28,7 +28,8 @@ param(
     [string]$EnvironmentName = "cae-whitelist-env",
     [string]$StorageAccount = "",
     [string]$BlobContainerName = "whitelist",
-    [string]$AuditTableName = "whitelist_audit"
+    [string]$AuditTableName = "whitelist_audit",
+    [string]$ClientQuotas = "erp-standard:5000,erp-premium:50000"
 )
 
 $ErrorActionPreference = "Stop"
@@ -124,7 +125,7 @@ az containerapp create `
         BLOB_STORAGE_URI="https://$StorageAccount.blob.core.windows.net/$BlobContainerName" `
         TABLE_STORAGE_URI="https://$StorageAccount.table.core.windows.net/" `
         AUDIT_TABLE_NAME="$AuditTableName" `
-        CLIENT_QUOTAS="erp-standard:5000,erp-premium:50000" `
+        CLIENT_QUOTAS="$ClientQuotas" `
         TZ="Europe/Warsaw" `
         DOTNET_GCHeapHardLimit="0x30000000" `
     --output none
