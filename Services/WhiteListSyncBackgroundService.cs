@@ -1,5 +1,6 @@
 namespace WhiteListApi.Services;
 
+using System.Globalization;
 using Azure.Storage.Blobs;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
@@ -9,6 +10,9 @@ using WhiteListApi.Storage;
 
 public sealed class WhiteListSyncBackgroundService : BackgroundService
 {
+    private static readonly TimeSpan LocalArtifactMaxAge = TimeSpan.FromDays(5);
+    private static readonly string[] LocalArtifactSuffixes = [".meta.json", ".7z.tmp", ".bin.tmp", ".bin"];
+
     private readonly MultiDayWhiteListManager _manager;
     private readonly IHttpClientFactory _httpClientFactory;
     private readonly BlobContainerClient? _blobContainer;
@@ -73,8 +77,61 @@ public sealed class WhiteListSyncBackgroundService : BackgroundService
         }
 
         _manager.EnforceRetentionPolicy(nowPl);
+        CleanupStaleLocalArtifacts();
         GC.Collect(2, GCCollectionMode.Aggressive, blocking: true, compacting: true);
         return allOk;
+    }
+
+    private void CleanupStaleLocalArtifacts()
+    {
+        DateTime cutoffUtc = DateTime.UtcNow - LocalArtifactMaxAge;
+        var loadedDates = new HashSet<string>(_manager.GetLoadedDates(), StringComparer.Ordinal);
+        int deletedCount = 0;
+
+        try
+        {
+            foreach (string filePath in Directory.EnumerateFiles(_dataDir, "*", SearchOption.TopDirectoryOnly))
+            {
+                string fileName = Path.GetFileName(filePath);
+                string? suffix = LocalArtifactSuffixes.FirstOrDefault(candidate =>
+                    fileName.EndsWith(candidate, StringComparison.Ordinal));
+                if (suffix is null)
+                    continue;
+
+                string rawDate = fileName[..^suffix.Length];
+                if (rawDate.Length != 8 || !DateOnly.TryParseExact(
+                        rawDate,
+                        "yyyyMMdd",
+                        CultureInfo.InvariantCulture,
+                        DateTimeStyles.None,
+                        out _))
+                    continue;
+
+                bool isLoadedSnapshotData = suffix is ".bin" or ".meta.json";
+                if (isLoadedSnapshotData && loadedDates.Contains(rawDate))
+                    continue;
+
+                try
+                {
+                    if (File.GetLastWriteTimeUtc(filePath) >= cutoffUtc)
+                        continue;
+
+                    File.Delete(filePath);
+                    deletedCount++;
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    _logger.LogWarning(ex, "Nie można usunąć starego lokalnego pliku danych {Path}.", filePath);
+                }
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _logger.LogWarning(ex, "Nie można przeskanować lokalnego katalogu danych {DataDir}.", _dataDir);
+        }
+
+        if (deletedCount > 0)
+            _logger.LogInformation("Usunięto {Count} starych lokalnych plików danych listy VAT.", deletedCount);
     }
 
     public async Task<bool> TryLoadDayAsync(string dateIso, string rawDate, CancellationToken ct)

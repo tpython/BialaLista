@@ -439,7 +439,7 @@ W katalogu tym tworzone są:
 * `{RRRRMMDD}.7z.tmp` i `{RRRRMMDD}.bin.tmp` – pliki tymczasowe tworzone wyłącznie na czas pobierania i strumieniowego parsowania paczki z MF, usuwane natychmiast po wygenerowaniu właściwego pliku `.bin`.
 
 **Zasady retencji i usuwania:**
-Aplikacja utrzymuje w katalogu lokalnym pliki dla **3 ostatnich dni** (dzisiaj, wczoraj, przedwczoraj wg strefy `Europe/Warsaw`). Starsze pliki `.bin` i `.meta.json` są automatycznie usuwane z dysku przez `MultiDayWhiteListManager.EnforceRetentionPolicy()`.
+Aplikacja utrzymuje aktywne dane lokalne dla **3 ostatnich dni** (dzisiaj, wczoraj, przedwczoraj wg strefy `Europe/Warsaw`). `MultiDayWhiteListManager.EnforceRetentionPolicy()` usuwa starsze załadowane snapshoty i ich pliki `.bin` oraz `.meta.json`. Po każdej synchronizacji dodatkowe sprzątanie usuwa datowane lokalne pliki `.bin`, `.meta.json`, `.7z.tmp` i `.bin.tmp`, których czas ostatniej modyfikacji przekracza 5 dni; obejmuje to również osierocone pliki po przerwanym procesie.
 
 **W chmurze (Azure Container Apps):**
 Jeśli skonfigurowano zmienną środowiskową `BLOB_STORAGE_URI`, przetworzone pliki `.bin` oraz `.meta.json` są automatycznie wysyłane do **Azure Blob Storage**. Kolejne uruchomienia lub nowe instancje kontenera pobierają gotowe pliki binarne bezpośrednio z Blob Storage w zaledwie 1–2 sekundy (pomijając czasochłonne pobieranie i rozpakowywanie `.7z` z serwerów MF).
